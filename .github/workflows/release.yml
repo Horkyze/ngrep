@@ -1,0 +1,79 @@
+name: Create Release
+
+on:
+  push:
+    branches:
+      - github-workflows
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build AMD64 binary
+        run: |
+          # Build Docker image
+          docker build -t ngrep-builder .
+          
+          # Run container to build binary
+          docker run --name ngrep-build ngrep-builder
+          
+          # Create bin directory
+          mkdir -p bin
+          
+          # Extract binary from container
+          docker cp ngrep-build:/output/ngrep.static ./bin/ngrep-amd64
+          
+          # Clean up
+          docker rm ngrep-build
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="manual-$(date +'%Y%m%d-%H%M%S')"
+          else
+            TAG="auto-$(date +'%Y%m%d-%H%M%S')"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Generated tag: $TAG"
+
+      - name: Create release
+        uses: actions/create-release@v1
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          release_name: Release ${{ steps.tag.outputs.tag }}
+          body: |
+            Automated release from commit ${{ github.sha }}
+            
+            **Changes:**
+            - Built from latest master branch
+            - Includes statically linked AMD64 binary
+            
+            **Binary Info:**
+            - Platform: Linux AMD64
+            - Static linking: Yes
+            - Dependencies: None (static binary)
+          draft: false
+          prerelease: false
+
+      - name: Upload AMD64 binary
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./bin/ngrep-amd64
+          asset_name: ngrep-amd64
+          asset_content_type: application/octet-stream
