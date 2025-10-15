@@ -184,6 +184,21 @@ this option to force ngrep to listen on interface \fIdev\fP.
 .IP "-A num"
 Dump \fInum\fP packets of trailing context after matching a packet.
 
+.IP "-E [ttl=seconds,timeout=seconds]"
+Enable container name resolution for IP addresses. When this option is
+specified, ngrep will attempt to resolve IP addresses to container names
+by analyzing network namespaces and container processes. Optional
+parameters can be specified as comma-separated key=value pairs:
+.B ttl=seconds
+sets the cache lifetime (default 30 seconds), and
+.B timeout=seconds
+sets the resolution timeout (default 1 second). This feature works with
+Docker, Podman, and other OCI-compliant container runtimes by examining
+network namespaces and process information in /proc. Container names are
+displayed in the format
+.I container_name(ip_address)
+when resolved successfully.
+
 .IP "\fI match expression\fP"
 A match expression is either an extended regular expression, or if the
 \fI-X\fP option is specified, a string signifying a hexadecimal value.

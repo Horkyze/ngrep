@@ -78,6 +78,7 @@
 #if !defined(_WIN32)
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #endif
 
 #include <pcap.h>
@@ -99,6 +100,38 @@
 
 #include "ngrep.h"
 
+#if !defined(_WIN32)
+/*
+ * Container Resolution Data Structures
+ */
+
+#define MAX_CONTAINERS 1024
+#define MAX_CONTAINER_NAME 64
+#define MAX_IP_ADDR_LEN 64
+
+struct container_entry {
+    char ip_addr[MAX_IP_ADDR_LEN];
+    char container_name[MAX_CONTAINER_NAME];
+    time_t last_seen;
+};
+
+struct container_cache {
+    struct container_entry entries[MAX_CONTAINERS];
+    uint32_t count;
+    time_t last_refresh;
+};
+
+/* Global container cache */
+static struct container_cache g_container_cache = {0};
+
+#endif /* !defined(_WIN32) */
+
+/* Container resolution function prototypes - always declared but conditionally implemented */
+static int refresh_container_cache(void);
+static const char* lookup_container_name(const char* ip_addr);
+static void cleanup_expired_cache_entries(void);
+static int discover_containers_via_cli(void);
+static void format_ip_with_container(const char* ip_addr, char* output, size_t output_size);
 
 /*
  * Configuration Options
@@ -118,6 +151,13 @@ uint8_t  invert_match = 0, bin_match = 0;
 uint8_t  live_read = 1, want_delay = 0;
 uint8_t  dont_dropprivs = 0;
 uint8_t  enable_hilite = 0;
+
+/*
+ * Container Resolution Configuration
+ */
+uint8_t  resolve_containers = 0;
+uint32_t container_cache_ttl = 30;
+uint32_t container_resolve_timeout = 1;
 
 char *read_file = NULL, *dump_file = NULL;
 char *usedev = NULL;
@@ -211,7 +251,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    while ((c = getopt(argc, argv, "LNhXViwqpevxlDtTRMK:Cs:n:c:d:A:I:O:S:P:F:W:")) != EOF) {
+    while ((c = getopt(argc, argv, "LNhXViwqpevxlDtTRMK:Cs:n:c:d:A:I:O:S:P:F:W:E::")) != EOF) {
         switch (c) {
             case 'W': {
                 if (!strcasecmp(optarg, "normal"))
@@ -345,6 +385,22 @@ int main(int argc, char **argv) {
                 tcpkill_active = _atoui32(optarg);
                 break;
 #endif
+            case 'E': {
+                resolve_containers = 1;
+                if (optarg) {
+                    /* Parse optional container options: ttl=30,timeout=1 */
+                    char *token = strtok(optarg, ",");
+                    while (token) {
+                        if (strncmp(token, "ttl=", 4) == 0) {
+                            container_cache_ttl = _atoui32(token + 4);
+                        } else if (strncmp(token, "timeout=", 8) == 0) {
+                            container_resolve_timeout = _atoui32(token + 8);
+                        }
+                        token = strtok(NULL, ",");
+                    }
+                }
+                break;
+            }
             case 'h':
                 usage();
             default:
@@ -415,6 +471,19 @@ int main(int argc, char **argv) {
 
 #if defined(_WIN32)
     win32_initwinsock();
+#endif
+
+#if !defined(_WIN32)
+    /* Initialize container cache if container resolution is enabled */
+    /* Note: This must be done BEFORE dropping privileges to access Docker socket */
+    if (resolve_containers) {
+        int cache_result = refresh_container_cache();
+        if (cache_result != 0) {
+            fprintf(stderr, "warning: failed to initialize container cache (returned %d)\n", cache_result);
+        } else {
+            fprintf(stderr, "info: container cache initialized with %u entries\n", g_container_cache.count);
+        }
+    }
 #endif
 
 #if !defined(_WIN32) && USE_DROPPRIVS
@@ -942,13 +1011,33 @@ void dump_packet(struct pcap_pkthdr *h, u_char *p, uint8_t proto, unsigned char 
     if (print_time)
         print_time(h);
 
-    if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP) && (sport || dport) && (hdr_offset || frag_offset == 0))
-
-        printf("%s:%u -> %s:%u", ip_src, sport, ip_dst, dport);
-
-    else
-
-        printf("%s -> %s", ip_src, ip_dst);
+    if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP) && (sport || dport) && (hdr_offset || frag_offset == 0)) {
+#if !defined(_WIN32)
+        if (resolve_containers) {
+            char src_formatted[128], dst_formatted[128];
+            format_ip_with_container(ip_src, src_formatted, sizeof(src_formatted));
+            format_ip_with_container(ip_dst, dst_formatted, sizeof(dst_formatted));
+            printf("%s:%u -> %s:%u", src_formatted, sport, dst_formatted, dport);
+        } else {
+#endif
+            printf("%s:%u -> %s:%u", ip_src, sport, ip_dst, dport);
+#if !defined(_WIN32)
+        }
+#endif
+    } else {
+#if !defined(_WIN32)
+        if (resolve_containers) {
+            char src_formatted[128], dst_formatted[128];
+            format_ip_with_container(ip_src, src_formatted, sizeof(src_formatted));
+            format_ip_with_container(ip_dst, dst_formatted, sizeof(dst_formatted));
+            printf("%s -> %s", src_formatted, dst_formatted);
+        } else {
+#endif
+            printf("%s -> %s", ip_src, ip_dst);
+#if !defined(_WIN32)
+        }
+#endif
+    }
 
     if (proto == IPPROTO_TCP && flags)
         printf(" [%s%s%s%s%s%s%s%s]",
@@ -1408,7 +1497,7 @@ void usage(void) {
 #if defined(_WIN32)
            "L"
 #endif
-           "hNXViwqpevxlDtTRM> <-IO pcap_dump> <-n num> <-d dev> <-A num>\n"
+           "hNXViwqpevxlDtTRME> <-IO pcap_dump> <-n num> <-d dev> <-A num>\n"
            "             <-s snaplen> <-S limitlen> <-W normal|byline|single|none> <-c cols>\n"
            "             <-P char> <-F file>"
 #if USE_TCPKILL
@@ -1453,6 +1542,7 @@ void usage(void) {
 #if USE_TCPKILL
            "   -K  is send N packets to kill observed connections\n"
 #endif
+           "   -E  is resolve container names for IP addresses (optional: ttl=30,timeout=1)\n"
            "");
 
     exit(2);
@@ -1607,5 +1697,210 @@ char *win32_choosedevice(void) {
         dev = pcap_lookupdev(errbuf);
 
     return dev;
+}
+#endif
+
+/*
+ * Container Resolution Functions
+ */
+
+static const char* lookup_container_name(const char* ip_addr) {
+    if (!resolve_containers || !ip_addr) {
+        return NULL;
+    }
+    
+    time_t now = time(NULL);
+    
+    /* Check if cache needs refresh */
+    if (now - g_container_cache.last_refresh > container_cache_ttl) {
+        refresh_container_cache();
+    }
+    
+    /* Cleanup expired entries */
+    cleanup_expired_cache_entries();
+    
+    /* Search cache for IP address */
+    for (uint32_t i = 0; i < g_container_cache.count; i++) {
+        if (strcmp(g_container_cache.entries[i].ip_addr, ip_addr) == 0) {
+            /* Update last seen timestamp */
+            g_container_cache.entries[i].last_seen = now;
+            return g_container_cache.entries[i].container_name;
+        }
+    }
+    
+    return NULL;
+}
+
+static int refresh_container_cache(void) {
+    if (!resolve_containers) {
+        return 0;
+    }
+
+    /* Clear current cache */
+    memset(&g_container_cache, 0, sizeof(g_container_cache));
+    g_container_cache.last_refresh = time(NULL);
+
+    /* Discover containers via Docker/Podman CLI commands */
+    return discover_containers_via_cli();
+}
+
+static void cleanup_expired_cache_entries(void) {
+    time_t now = time(NULL);
+    uint32_t write_idx = 0;
+    
+    for (uint32_t read_idx = 0; read_idx < g_container_cache.count; read_idx++) {
+        if (now - g_container_cache.entries[read_idx].last_seen <= container_cache_ttl) {
+            if (write_idx != read_idx) {
+                g_container_cache.entries[write_idx] = g_container_cache.entries[read_idx];
+            }
+            write_idx++;
+        }
+    }
+    
+    g_container_cache.count = write_idx;
+}
+
+static int discover_containers_via_cli(void) {
+    FILE *fp;
+    char line[512];
+    char cmd[512];
+    uint32_t cache_idx = 0;
+    
+    /* Try Docker first */
+    fp = popen("docker ps --format '{{.Names}}' --no-trunc 2>/dev/null", "r");
+    if (fp) {
+        while (fgets(line, sizeof(line), fp) && cache_idx < MAX_CONTAINERS) {
+            /* Remove newline */
+            line[strcspn(line, "\n")] = '\0';
+            
+            if (strlen(line) > 0) {
+                /* For each container, get IP addresses */
+                snprintf(cmd, sizeof(cmd), 
+                        "docker inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
+                        line);
+                
+                FILE *inspect_fp = popen(cmd, "r");
+                if (inspect_fp) {
+                    char ips[256];
+                    if (fgets(ips, sizeof(ips), inspect_fp)) {
+                        char *ip = strtok(ips, " \n");
+                        while (ip && cache_idx < MAX_CONTAINERS) {
+                            if (strlen(ip) > 0 && strcmp(ip, "") != 0) {
+                                strncpy(g_container_cache.entries[cache_idx].container_name, 
+                                       line, MAX_CONTAINER_NAME - 1);
+                                g_container_cache.entries[cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
+                                
+                                strncpy(g_container_cache.entries[cache_idx].ip_addr, 
+                                       ip, MAX_IP_ADDR_LEN - 1);
+                                g_container_cache.entries[cache_idx].ip_addr[MAX_IP_ADDR_LEN - 1] = '\0';
+                                
+                                g_container_cache.entries[cache_idx].last_seen = time(NULL);
+                                cache_idx++;
+                            }
+                            ip = strtok(NULL, " \n");
+                        }
+                    }
+                    pclose(inspect_fp);
+                }
+            }
+        }
+        pclose(fp);
+    }
+    
+    /* Try Podman if Docker didn't find containers or isn't available */
+    if (cache_idx == 0) {
+        fp = popen("podman ps --format '{{.Names}}' --no-trunc 2>/dev/null", "r");
+        if (fp) {
+            while (fgets(line, sizeof(line), fp) && cache_idx < MAX_CONTAINERS) {
+                /* Remove newline */
+                line[strcspn(line, "\n")] = '\0';
+                
+                if (strlen(line) > 0) {
+                    snprintf(cmd, sizeof(cmd), 
+                            "podman inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
+                            line);
+                    
+                    FILE *inspect_fp = popen(cmd, "r");
+                    if (inspect_fp) {
+                        char ips[256];
+                        if (fgets(ips, sizeof(ips), inspect_fp)) {
+                            char *ip = strtok(ips, " \n");
+                            while (ip && cache_idx < MAX_CONTAINERS) {
+                                if (strlen(ip) > 0 && strcmp(ip, "") != 0) {
+                                    strncpy(g_container_cache.entries[cache_idx].container_name, 
+                                           line, MAX_CONTAINER_NAME - 1);
+                                    g_container_cache.entries[cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
+                                    
+                                    strncpy(g_container_cache.entries[cache_idx].ip_addr, 
+                                           ip, MAX_IP_ADDR_LEN - 1);
+                                    g_container_cache.entries[cache_idx].ip_addr[MAX_IP_ADDR_LEN - 1] = '\0';
+                                    
+                                    g_container_cache.entries[cache_idx].last_seen = time(NULL);
+                                    cache_idx++;
+                                }
+                                ip = strtok(NULL, " \n");
+                            }
+                        }
+                        pclose(inspect_fp);
+                    }
+                }
+            }
+            pclose(fp);
+        }
+    }
+    
+    g_container_cache.count = cache_idx;
+    return cache_idx > 0 ? 0 : -1;
+}
+
+static void format_ip_with_container(const char* ip_addr, char* output, size_t output_size) {
+#if !defined(_WIN32)
+    const char* container_name;
+    
+    if (!ip_addr || !output || output_size == 0) {
+        if (output && output_size > 0) {
+            output[0] = '\0';
+        }
+        return;
+    }
+    
+    /* Try to resolve container name */
+    container_name = lookup_container_name(ip_addr);
+    
+    if (container_name && strlen(container_name) > 0) {
+        /* Format as: container_name(ip_addr) */
+        snprintf(output, output_size, "%s(%s)", container_name, ip_addr);
+    } else {
+        /* Just use the IP address */
+        strncpy(output, ip_addr, output_size - 1);
+        output[output_size - 1] = '\0';
+    }
+#else
+    /* On Windows, just copy the IP address */
+    if (ip_addr && output && output_size > 0) {
+        strncpy(output, ip_addr, output_size - 1);
+        output[output_size - 1] = '\0';
+    }
+#endif
+}
+
+#if defined(_WIN32)
+/* Windows stub implementations for container resolution functions */
+
+static const char* lookup_container_name(const char* ip_addr) {
+    (void)ip_addr; /* Suppress unused parameter warning */
+    return NULL;
+}
+
+static int refresh_container_cache(void) {
+    return 0;
+}
+
+static void cleanup_expired_cache_entries(void) {
+    /* Do nothing on Windows */
+}
+
+static int discover_containers_via_cli(void) {
+    return 0;
 }
 #endif
