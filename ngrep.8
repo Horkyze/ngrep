@@ -191,6 +191,26 @@ this option to force ngrep to listen on interface \fIdev\fP.
 .IP "-A num"
 Dump \fInum\fP packets of trailing context after matching a packet.
 
+.SH COMPILE-TIME OPTIONS
+
+Some features of ngrep can be enabled or disabled at compile-time by
+passing options to the
+.B configure
+script before building.
+
+.IP "--enable-container-resolution"
+Enable container name resolution for IP addresses. When this feature is
+compiled in, ngrep will automatically resolve IP addresses to container names
+by querying Docker or Podman. Container names are displayed in the format
+.I container_name(ip_address)
+when resolved successfully. This feature works with Docker, Podman, and other
+OCI-compliant container runtimes. Note: This feature must be enabled at
+compile-time using
+.B ./configure --enable-container-resolution
+before building ngrep.
+
+.SH MATCH AND FILTER EXPRESSIONS
+
 .IP "\fI match expression\fP"
 A match expression is either an extended regular expression, or if the
 \fI-X\fP option is specified, a string signifying a hexadecimal value.
