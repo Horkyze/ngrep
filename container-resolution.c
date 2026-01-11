@@ -56,18 +56,21 @@ struct container_cache {
 
 /* Global container cache */
 static struct container_cache g_container_cache = {0};
-static uint32_t cache_ttl = DEFAULT_CACHE_TTL;
+static const uint32_t cache_ttl = DEFAULT_CACHE_TTL;
 
 /* Docker socket for real-time events */
 static int docker_events_fd = -1;
 static int using_realtime_events = 0;
 static char event_buffer[4096];
 static size_t event_buffer_len = 0;
+/* Runtime used for socket/events + inspect commands ("docker" or "podman") */
+static const char *event_runtime = "docker";
 
 /* Forward declarations for internal functions */
 static const char* lookup_container_name(const char* ip_addr);
 static void cleanup_expired_cache_entries(void);
 static int discover_containers_via_cli(void);
+static int discover_containers_for_runtime(const char *runtime, uint32_t *cache_idx);
 
 /* Docker socket event functions */
 static int connect_to_docker_socket(void);
@@ -84,6 +87,9 @@ static int is_valid_container_id(const char *id);
  */
 
 int container_resolution_init(void) {
+    /* Ensure we don't leak any previous socket/event state */
+    container_cleanup();
+
     /* Clear current cache */
     memset(&g_container_cache, 0, sizeof(g_container_cache));
     g_container_cache.last_refresh = time(NULL);
@@ -196,121 +202,87 @@ static void cleanup_expired_cache_entries(void) {
     g_container_cache.count = write_idx;
 }
 
-static int discover_containers_via_cli(void) {
+/*
+ * Discover containers for a specific runtime (docker or podman).
+ * Returns 0 on success, -1 on failure. Updates cache_idx with new count.
+ */
+static int discover_containers_for_runtime(const char *runtime, uint32_t *cache_idx) {
     FILE *fp;
     char line[512];
     char cmd[512];
-    uint32_t cache_idx = 0;
 
-    /* Try Docker first - get both ID and Name */
-    fp = popen("docker ps --format '{{.ID}}:{{.Names}}' --no-trunc 2>/dev/null", "r");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp) && cache_idx < MAX_CONTAINERS) {
-            /* Remove newline */
-            line[strcspn(line, "\n")] = '\0';
-
-            /* Parse ID:Name format */
-            char *colon = strchr(line, ':');
-            if (!colon || strlen(line) == 0) continue;
-
-            *colon = '\0';
-            char *container_id = line;
-            char *container_name = colon + 1;
-
-            if (strlen(container_name) > 0) {
-                /* For each container, get IP addresses */
-                snprintf(cmd, sizeof(cmd),
-                        "docker inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
-                        container_id);
-
-                FILE *inspect_fp = popen(cmd, "r");
-                if (inspect_fp) {
-                    char ips[256];
-                    if (fgets(ips, sizeof(ips), inspect_fp)) {
-                        char *ip = strtok(ips, " \n");
-                        while (ip && cache_idx < MAX_CONTAINERS) {
-                            if (strlen(ip) > 0 && strcmp(ip, "") != 0) {
-                                strncpy(g_container_cache.entries[cache_idx].container_name,
-                                       container_name, MAX_CONTAINER_NAME - 1);
-                                g_container_cache.entries[cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
-
-                                strncpy(g_container_cache.entries[cache_idx].ip_addr,
-                                       ip, MAX_IP_ADDR_LEN - 1);
-                                g_container_cache.entries[cache_idx].ip_addr[MAX_IP_ADDR_LEN - 1] = '\0';
-
-                                strncpy(g_container_cache.entries[cache_idx].container_id,
-                                       container_id, MAX_CONTAINER_ID - 1);
-                                g_container_cache.entries[cache_idx].container_id[MAX_CONTAINER_ID - 1] = '\0';
-
-                                g_container_cache.entries[cache_idx].last_seen = time(NULL);
-                                cache_idx++;
-                            }
-                            ip = strtok(NULL, " \n");
-                        }
-                    }
-                    pclose(inspect_fp);
-                }
-            }
-        }
-        pclose(fp);
+    snprintf(cmd, sizeof(cmd), "%s ps --format '{{.ID}}:{{.Names}}' --no-trunc 2>/dev/null", runtime);
+    fp = popen(cmd, "r");
+    if (!fp) {
+        return -1;
     }
 
-    /* Try Podman if Docker didn't find containers or isn't available */
-    if (cache_idx == 0) {
-        fp = popen("podman ps --format '{{.ID}}:{{.Names}}' --no-trunc 2>/dev/null", "r");
-        if (fp) {
-            while (fgets(line, sizeof(line), fp) && cache_idx < MAX_CONTAINERS) {
-                /* Remove newline */
-                line[strcspn(line, "\n")] = '\0';
+    while (fgets(line, sizeof(line), fp) && *cache_idx < MAX_CONTAINERS) {
+        /* Remove newline */
+        line[strcspn(line, "\n")] = '\0';
 
-                /* Parse ID:Name format */
-                char *colon = strchr(line, ':');
-                if (!colon || strlen(line) == 0) continue;
+        /* Parse ID:Name format */
+        char *colon = strchr(line, ':');
+        if (!colon || strlen(line) == 0) continue;
 
-                *colon = '\0';
-                char *container_id = line;
-                char *container_name = colon + 1;
+        *colon = '\0';
+        char *container_id = line;
+        char *container_name = colon + 1;
 
-                if (strlen(container_name) > 0) {
-                    snprintf(cmd, sizeof(cmd),
-                            "podman inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
-                            container_id);
+        if (strlen(container_name) > 0) {
+            /* For each container, get IP addresses */
+            snprintf(cmd, sizeof(cmd),
+                    "%s inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
+                    runtime, container_id);
 
-                    FILE *inspect_fp = popen(cmd, "r");
-                    if (inspect_fp) {
-                        char ips[256];
-                        if (fgets(ips, sizeof(ips), inspect_fp)) {
-                            char *ip = strtok(ips, " \n");
-                            while (ip && cache_idx < MAX_CONTAINERS) {
-                                if (strlen(ip) > 0 && strcmp(ip, "") != 0) {
-                                    strncpy(g_container_cache.entries[cache_idx].container_name,
-                                           container_name, MAX_CONTAINER_NAME - 1);
-                                    g_container_cache.entries[cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
+            FILE *inspect_fp = popen(cmd, "r");
+            if (inspect_fp) {
+                char ips[256];
+                if (fgets(ips, sizeof(ips), inspect_fp)) {
+                    char *ip = strtok(ips, " \n");
+                    while (ip && *cache_idx < MAX_CONTAINERS) {
+                        if (strlen(ip) > 0) {
+                            strncpy(g_container_cache.entries[*cache_idx].container_name,
+                                   container_name, MAX_CONTAINER_NAME - 1);
+                            g_container_cache.entries[*cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
 
-                                    strncpy(g_container_cache.entries[cache_idx].ip_addr,
-                                           ip, MAX_IP_ADDR_LEN - 1);
-                                    g_container_cache.entries[cache_idx].ip_addr[MAX_IP_ADDR_LEN - 1] = '\0';
+                            strncpy(g_container_cache.entries[*cache_idx].ip_addr,
+                                   ip, MAX_IP_ADDR_LEN - 1);
+                            g_container_cache.entries[*cache_idx].ip_addr[MAX_IP_ADDR_LEN - 1] = '\0';
 
-                                    strncpy(g_container_cache.entries[cache_idx].container_id,
-                                           container_id, MAX_CONTAINER_ID - 1);
-                                    g_container_cache.entries[cache_idx].container_id[MAX_CONTAINER_ID - 1] = '\0';
+                            strncpy(g_container_cache.entries[*cache_idx].container_id,
+                                   container_id, MAX_CONTAINER_ID - 1);
+                            g_container_cache.entries[*cache_idx].container_id[MAX_CONTAINER_ID - 1] = '\0';
 
-                                    g_container_cache.entries[cache_idx].last_seen = time(NULL);
-                                    cache_idx++;
-                                }
-                                ip = strtok(NULL, " \n");
-                            }
+                            g_container_cache.entries[*cache_idx].last_seen = time(NULL);
+                            (*cache_idx)++;
                         }
-                        pclose(inspect_fp);
+                        ip = strtok(NULL, " \n");
                     }
                 }
+                pclose(inspect_fp);
             }
-            pclose(fp);
         }
+    }
+    pclose(fp);
+
+    return 0;
+}
+
+static int discover_containers_via_cli(void) {
+    uint32_t cache_idx = 0;
+
+    /* Try Docker first */
+    discover_containers_for_runtime("docker", &cache_idx);
+
+    /* Try Podman if Docker didn't find containers */
+    if (cache_idx == 0) {
+        discover_containers_for_runtime("podman", &cache_idx);
     }
 
     g_container_cache.count = cache_idx;
-    return cache_idx > 0 ? 0 : -1;
+    /* "No containers found" is not an error; leave cache empty. */
+    return 0;
 }
 
 /*
@@ -325,6 +297,7 @@ static int connect_to_docker_socket(void) {
     const char *socket_path = DOCKER_SOCKET_PATH;
 
     /* Try Docker socket first */
+    event_runtime = "docker";
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -339,6 +312,7 @@ static int connect_to_docker_socket(void) {
 
         /* Try Podman socket as fallback */
         socket_path = PODMAN_SOCKET_PATH;
+        event_runtime = "podman";
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
             return -1;
@@ -465,6 +439,10 @@ static void process_docker_events(void) {
     }
 }
 
+/*
+ * Extract a string value from JSON by key.
+ * WARNING: Returns pointer to static buffer - copy result before calling again!
+ */
 static char* extract_json_string(const char *json, const char *key) {
     static char value[256];
     char search_key[128];
@@ -502,10 +480,20 @@ static char* extract_json_string(const char *json, const char *key) {
 }
 
 static void handle_container_event(const char *event_json) {
+    /* NOTE: extract_json_string() uses a static buffer; copy immediately. */
     char *status = extract_json_string(event_json, "status");
+    char status_copy[32];
+
+    if (!status) {
+        return;
+    }
+
+    strncpy(status_copy, status, sizeof(status_copy) - 1);
+    status_copy[sizeof(status_copy) - 1] = '\0';
+
     char *container_id = extract_json_string(event_json, "id");
 
-    if (!status || !container_id) {
+    if (!container_id) {
         return;
     }
 
@@ -514,9 +502,9 @@ static void handle_container_event(const char *event_json) {
     strncpy(id_copy, container_id, sizeof(id_copy) - 1);
     id_copy[sizeof(id_copy) - 1] = '\0';
 
-    if (strcmp(status, "start") == 0) {
+    if (strcmp(status_copy, "start") == 0) {
         add_container_by_id(id_copy);
-    } else if (strcmp(status, "die") == 0) {
+    } else if (strcmp(status_copy, "die") == 0) {
         remove_container_by_id(id_copy);
     }
 }
@@ -543,10 +531,8 @@ static int is_valid_container_id(const char *id) {
 
     for (i = 0; i < len; i++) {
         char c = id[i];
-        /* Allow hex chars for IDs, plus alphanumeric, underscore, dash, dot for names */
+        /* Allow alphanumeric, underscore, dash, dot for container IDs and names */
         if (!((c >= '0' && c <= '9') ||
-              (c >= 'a' && c <= 'f') ||
-              (c >= 'A' && c <= 'F') ||
               (c >= 'A' && c <= 'Z') ||
               (c >= 'a' && c <= 'z') ||
               c == '_' || c == '-' || c == '.')) {
@@ -573,8 +559,8 @@ static int add_container_by_id(const char *container_id) {
 
     /* Get container name */
     snprintf(cmd, sizeof(cmd),
-        "docker inspect %s --format '{{.Name}}' 2>/dev/null | sed 's/^\\///'",
-        container_id);
+        "%s inspect %s --format '{{.Name}}' 2>/dev/null",
+        event_runtime, container_id);
 
     fp = popen(cmd, "r");
     if (!fp) {
@@ -587,6 +573,10 @@ static int add_container_by_id(const char *container_id) {
     }
     pclose(fp);
     name[strcspn(name, "\n")] = '\0';
+    /* Docker/Podman prefix names with '/', strip it to match CLI `.Names` */
+    if (name[0] == '/') {
+        memmove(name, name + 1, strlen(name));
+    }
 
     if (strlen(name) == 0) {
         return -1;
@@ -594,8 +584,8 @@ static int add_container_by_id(const char *container_id) {
 
     /* Get container IP addresses */
     snprintf(cmd, sizeof(cmd),
-        "docker inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
-        container_id);
+        "%s inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
+        event_runtime, container_id);
 
     fp = popen(cmd, "r");
     if (!fp) {

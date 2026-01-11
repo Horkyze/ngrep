@@ -469,9 +469,10 @@ int main(int argc, char **argv) {
         int cache_result = container_resolution_init();
         if (cache_result != 0) {
             fprintf(stderr, "warning: failed to initialize container cache (returned %d)\n", cache_result);
-        } else {
+        } else if (!quiet) {
             fprintf(stderr, "info: container cache initialized\n");
         }
+        atexit(container_cleanup);
     }
 #endif
 
