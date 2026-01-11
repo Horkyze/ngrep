@@ -229,7 +229,7 @@ static int discover_containers_via_cli(void) {
                     if (fgets(ips, sizeof(ips), inspect_fp)) {
                         char *ip = strtok(ips, " \n");
                         while (ip && cache_idx < MAX_CONTAINERS) {
-                            if (strlen(ip) > 0 && strcmp(ip, "") != 0) {
+                            if (strlen(ip) > 0) {
                                 strncpy(g_container_cache.entries[cache_idx].container_name,
                                        container_name, MAX_CONTAINER_NAME - 1);
                                 g_container_cache.entries[cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
@@ -282,7 +282,7 @@ static int discover_containers_via_cli(void) {
                         if (fgets(ips, sizeof(ips), inspect_fp)) {
                             char *ip = strtok(ips, " \n");
                             while (ip && cache_idx < MAX_CONTAINERS) {
-                                if (strlen(ip) > 0 && strcmp(ip, "") != 0) {
+                                if (strlen(ip) > 0) {
                                     strncpy(g_container_cache.entries[cache_idx].container_name,
                                            container_name, MAX_CONTAINER_NAME - 1);
                                     g_container_cache.entries[cache_idx].container_name[MAX_CONTAINER_NAME - 1] = '\0';
@@ -543,10 +543,8 @@ static int is_valid_container_id(const char *id) {
 
     for (i = 0; i < len; i++) {
         char c = id[i];
-        /* Allow hex chars for IDs, plus alphanumeric, underscore, dash, dot for names */
+        /* Allow alphanumeric, underscore, dash, dot for container IDs and names */
         if (!((c >= '0' && c <= '9') ||
-              (c >= 'a' && c <= 'f') ||
-              (c >= 'A' && c <= 'F') ||
               (c >= 'A' && c <= 'Z') ||
               (c >= 'a' && c <= 'z') ||
               c == '_' || c == '-' || c == '.')) {
