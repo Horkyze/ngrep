@@ -1,0 +1,29 @@
+# Dockerfile for building static ngrep binary for releases
+FROM alpine:3.20
+
+# Install build dependencies (static versions)
+RUN apk add --no-cache \
+    build-base \
+    autoconf \
+    automake \
+    libpcap-dev \
+    pcre2-dev \
+    linux-headers
+
+# Copy source code
+WORKDIR /build
+COPY . .
+
+# Build ngrep with static linking
+# Note: Full static linking with libpcap is tricky, so we build a mostly-static binary
+RUN ./configure --enable-ipv6 --enable-pcre2 && \
+    make LDFLAGS="-static" && \
+    strip ngrep && \
+    mkdir -p /output && \
+    cp ngrep /output/ngrep.static
+
+# Verify the binary
+RUN ls -la /output/ngrep.static && \
+    file /output/ngrep.static
+
+CMD ["echo", "Build complete. Binary at /output/ngrep.static"]
