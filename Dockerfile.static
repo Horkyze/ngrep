@@ -16,7 +16,7 @@ COPY . .
 
 # Build ngrep with static linking
 # Note: Full static linking with libpcap is tricky, so we build a mostly-static binary
-RUN ./configure --enable-ipv6 --enable-pcre2 && \
+RUN ./configure --enable-ipv6 --enable-pcre2 --enable-container-resolution && \
     make LDFLAGS="-static" && \
     strip ngrep && \
     mkdir -p /output && \
