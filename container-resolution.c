@@ -63,6 +63,8 @@ static int docker_events_fd = -1;
 static int using_realtime_events = 0;
 static char event_buffer[4096];
 static size_t event_buffer_len = 0;
+/* Runtime used for socket/events + inspect commands ("docker" or "podman") */
+static const char *event_runtime = "docker";
 
 /* Forward declarations for internal functions */
 static const char* lookup_container_name(const char* ip_addr);
@@ -85,6 +87,9 @@ static int is_valid_container_id(const char *id);
  */
 
 int container_resolution_init(void) {
+    /* Ensure we don't leak any previous socket/event state */
+    container_cleanup();
+
     /* Clear current cache */
     memset(&g_container_cache, 0, sizeof(g_container_cache));
     g_container_cache.last_refresh = time(NULL);
@@ -276,7 +281,8 @@ static int discover_containers_via_cli(void) {
     }
 
     g_container_cache.count = cache_idx;
-    return cache_idx > 0 ? 0 : -1;
+    /* "No containers found" is not an error; leave cache empty. */
+    return 0;
 }
 
 /*
@@ -291,6 +297,7 @@ static int connect_to_docker_socket(void) {
     const char *socket_path = DOCKER_SOCKET_PATH;
 
     /* Try Docker socket first */
+    event_runtime = "docker";
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -305,6 +312,7 @@ static int connect_to_docker_socket(void) {
 
         /* Try Podman socket as fallback */
         socket_path = PODMAN_SOCKET_PATH;
+        event_runtime = "podman";
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
             return -1;
@@ -472,10 +480,20 @@ static char* extract_json_string(const char *json, const char *key) {
 }
 
 static void handle_container_event(const char *event_json) {
+    /* NOTE: extract_json_string() uses a static buffer; copy immediately. */
     char *status = extract_json_string(event_json, "status");
+    char status_copy[32];
+
+    if (!status) {
+        return;
+    }
+
+    strncpy(status_copy, status, sizeof(status_copy) - 1);
+    status_copy[sizeof(status_copy) - 1] = '\0';
+
     char *container_id = extract_json_string(event_json, "id");
 
-    if (!status || !container_id) {
+    if (!container_id) {
         return;
     }
 
@@ -484,9 +502,9 @@ static void handle_container_event(const char *event_json) {
     strncpy(id_copy, container_id, sizeof(id_copy) - 1);
     id_copy[sizeof(id_copy) - 1] = '\0';
 
-    if (strcmp(status, "start") == 0) {
+    if (strcmp(status_copy, "start") == 0) {
         add_container_by_id(id_copy);
-    } else if (strcmp(status, "die") == 0) {
+    } else if (strcmp(status_copy, "die") == 0) {
         remove_container_by_id(id_copy);
     }
 }
@@ -541,8 +559,8 @@ static int add_container_by_id(const char *container_id) {
 
     /* Get container name */
     snprintf(cmd, sizeof(cmd),
-        "docker inspect %s --format '{{.Name}}' 2>/dev/null | sed 's/^\\///'",
-        container_id);
+        "%s inspect %s --format '{{.Name}}' 2>/dev/null",
+        event_runtime, container_id);
 
     fp = popen(cmd, "r");
     if (!fp) {
@@ -555,6 +573,10 @@ static int add_container_by_id(const char *container_id) {
     }
     pclose(fp);
     name[strcspn(name, "\n")] = '\0';
+    /* Docker/Podman prefix names with '/', strip it to match CLI `.Names` */
+    if (name[0] == '/') {
+        memmove(name, name + 1, strlen(name));
+    }
 
     if (strlen(name) == 0) {
         return -1;
@@ -562,8 +584,8 @@ static int add_container_by_id(const char *container_id) {
 
     /* Get container IP addresses */
     snprintf(cmd, sizeof(cmd),
-        "docker inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
-        container_id);
+        "%s inspect %s --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null",
+        event_runtime, container_id);
 
     fp = popen(cmd, "r");
     if (!fp) {
