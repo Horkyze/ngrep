@@ -20,18 +20,18 @@ jobs:
 
       - name: Build AMD64 binary
         run: |
-          # Build Docker image
-          docker build -t ngrep-builder .
-          
+          # Build Docker image using static build Dockerfile
+          docker build -f Dockerfile.static -t ngrep-builder .
+
           # Run container to build binary
           docker run --name ngrep-build ngrep-builder
-          
+
           # Create bin directory
           mkdir -p bin
-          
+
           # Extract binary from container
           docker cp ngrep-build:/output/ngrep.static ./bin/ngrep-amd64
-          
+
           # Clean up
           docker rm ngrep-build
 
